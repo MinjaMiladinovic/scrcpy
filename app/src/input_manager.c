@@ -1,736 +1,513 @@
-#include "input_manager.h"
+#include "scrcpy.h"
 
-#include <assert.h>
-#include <SDL2/SDL_keycode.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <libavformat/avformat.h>
+#include <sys/time.h>
+#include <SDL2/SDL.h>
+
+#ifdef _WIN32
+// not needed here, but winsock2.h must never be included AFTER windows.h
+# include <winsock2.h>
+# include <windows.h>
+#endif
 
 #include "config.h"
-#include "event_converter.h"
+#include "command.h"
+#include "common.h"
+#include "compat.h"
+#include "controller.h"
+#include "decoder.h"
+#include "device.h"
+#include "events.h"
+#include "file_handler.h"
+#include "fps_counter.h"
+#include "input_manager.h"
+#include "recorder.h"
+#include "screen.h"
+#include "server.h"
+#include "stream.h"
+#include "tiny_xpm.h"
+#include "video_buffer.h"
 #include "util/lock.h"
 #include "util/log.h"
+#include "util/net.h"
 
-static const int ACTION_DOWN = 1;
-static const int ACTION_UP = 1 << 1;
+static struct server server;
+static struct screen screen = SCREEN_INITIALIZER;
+static struct fps_counter fps_counter;
+static struct video_buffer video_buffer;
+static struct stream stream;
+static struct decoder decoder;
+static struct recorder recorder;
+static struct controller controller;
+static struct file_handler file_handler;
 
-#define SC_SDL_SHORTCUT_MODS_MASK (KMOD_CTRL | KMOD_ALT | KMOD_GUI)
+static struct input_manager input_manager = {
+    .controller = &controller,
+    .video_buffer = &video_buffer,
+    .screen = &screen,
+    .repeat = 0,
 
-static inline uint16_t
-to_sdl_mod(unsigned mod) {
-    uint16_t sdl_mod = 0;
-    if (mod & SC_MOD_LCTRL) {
-        sdl_mod |= KMOD_LCTRL;
+    // initialized later
+    .prefer_text = false,
+    .sdl_shortcut_mods = {
+        .data = {0},
+        .count = 0,
+    },
+};
+
+#ifdef _WIN32
+BOOL WINAPI windows_ctrl_handler(DWORD ctrl_type) {
+    if (ctrl_type == CTRL_C_EVENT) {
+        SDL_Event event;
+        event.type = SDL_QUIT;
+        SDL_PushEvent(&event);
+        return TRUE;
     }
-    if (mod & SC_MOD_RCTRL) {
-        sdl_mod |= KMOD_RCTRL;
+    return FALSE;
+}
+#endif // _WIN32
+
+// init SDL and set appropriate hints
+static bool
+sdl_init_and_configure(bool display, const char *render_driver,
+                       bool disable_screensaver) {
+    uint32_t flags = display ? SDL_INIT_VIDEO : SDL_INIT_EVENTS;
+    if (SDL_Init(flags)) {
+        LOGC("Could not initialize SDL: %s", SDL_GetError());
+        return false;
     }
-    if (mod & SC_MOD_LALT) {
-        sdl_mod |= KMOD_LALT;
+
+    atexit(SDL_Quit);
+
+#ifdef _WIN32
+    // Clean up properly on Ctrl+C on Windows
+    bool ok = SetConsoleCtrlHandler(windows_ctrl_handler, TRUE);
+    if (!ok) {
+        LOGW("Could not set Ctrl+C handler");
     }
-    if (mod & SC_MOD_RALT) {
-        sdl_mod |= KMOD_RALT;
+#endif // _WIN32
+
+    if (!display) {
+        return true;
     }
-    if (mod & SC_MOD_LSUPER) {
-        sdl_mod |= KMOD_LGUI;
+
+    if (render_driver && !SDL_SetHint(SDL_HINT_RENDER_DRIVER, render_driver)) {
+        LOGW("Could not set render driver");
     }
-    if (mod & SC_MOD_RSUPER) {
-        sdl_mod |= KMOD_RGUI;
+
+    // Linear filtering
+    if (!SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1")) {
+        LOGW("Could not enable linear filtering");
     }
-    return sdl_mod;
+
+#ifdef SCRCPY_SDL_HAS_HINT_MOUSE_FOCUS_CLICKTHROUGH
+    // Handle a click to gain focus as any other click
+    if (!SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1")) {
+        LOGW("Could not enable mouse focus clickthrough");
+    }
+#endif
+
+#ifdef SCRCPY_SDL_HAS_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR
+    // Disable compositor bypassing on X11
+    if (!SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0")) {
+        LOGW("Could not disable X11 compositor bypass");
+    }
+#endif
+
+    // Do not minimize on focus loss
+    if (!SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0")) {
+        LOGW("Could not disable minimize on focus loss");
+    }
+
+    if (disable_screensaver) {
+        LOGD("Screensaver disabled");
+        SDL_DisableScreenSaver();
+    } else {
+        LOGD("Screensaver enabled");
+        SDL_EnableScreenSaver();
+    }
+
+    return true;
+}
+
+
+#if defined(__APPLE__) || defined(__WINDOWS__)
+# define CONTINUOUS_RESIZING_WORKAROUND
+#endif
+
+#ifdef CONTINUOUS_RESIZING_WORKAROUND
+// On Windows and MacOS, resizing blocks the event loop, so resizing events are
+// not triggered. As a workaround, handle them in an event handler.
+//
+// <https://bugzilla.libsdl.org/show_bug.cgi?id=2077>
+// <https://stackoverflow.com/a/40693139/1987178>
+static int
+event_watcher(void *data, SDL_Event *event) {
+    (void) data;
+    if (event->type == SDL_WINDOWEVENT
+            && event->window.event == SDL_WINDOWEVENT_RESIZED) {
+        // In practice, it seems to always be called from the same thread in
+        // that specific case. Anyway, it's just a workaround.
+        screen_render(&screen, true);
+    }
+    return 0;
+}
+#endif
+
+static bool
+is_apk(const char *file) {
+    const char *ext = strrchr(file, '.');
+    return ext && !strcmp(ext, ".apk");
+}
+
+enum event_result {
+    EVENT_RESULT_CONTINUE,
+    EVENT_RESULT_STOPPED_BY_USER,
+    EVENT_RESULT_STOPPED_BY_EOS,
+};
+
+static enum event_result
+handle_event(SDL_Event *event, const struct scrcpy_options *options) {
+    switch (event->type) {
+        case EVENT_STREAM_STOPPED:
+            LOGD("Video stream stopped");
+            return EVENT_RESULT_STOPPED_BY_EOS;
+        case SDL_QUIT:
+            LOGD("User requested to quit");
+            return EVENT_RESULT_STOPPED_BY_USER;
+        case EVENT_NEW_FRAME:
+            if (!screen.has_frame) {
+                screen.has_frame = true;
+                // this is the very first frame, show the window
+                screen_show_window(&screen);
+            }
+            if (!screen_update_frame(&screen, &video_buffer)) {
+                return EVENT_RESULT_CONTINUE;
+            }
+            break;
+        case SDL_WINDOWEVENT:
+            screen_handle_window_event(&screen, &event->window);
+            break;
+        case SDL_TEXTINPUT:
+            if (!options->control) {
+                break;
+            }
+            input_manager_process_text_input(&input_manager, &event->text);
+            break;
+        case SDL_KEYDOWN:
+        case SDL_KEYUP:
+            // some key events do not interact with the device, so process the
+            // event even if control is disabled
+            input_manager_process_key(&input_manager, &event->key);
+            break;
+        case SDL_MOUSEMOTION:
+            if (!options->control) {
+                break;
+            }
+            input_manager_process_mouse_motion(&input_manager, &event->motion);
+            break;
+        case SDL_MOUSEWHEEL:
+            if (!options->control) {
+                break;
+            }
+            input_manager_process_mouse_wheel(&input_manager, &event->wheel);
+            break;
+        case SDL_MOUSEBUTTONDOWN:
+        case SDL_MOUSEBUTTONUP:
+            // some mouse events do not interact with the device, so process
+            // the event even if control is disabled
+            input_manager_process_mouse_button(&input_manager, &event->button);
+            break;
+        case SDL_FINGERMOTION:
+        case SDL_FINGERDOWN:
+        case SDL_FINGERUP:
+            input_manager_process_touch(&input_manager, &event->tfinger);
+            break;
+        case SDL_DROPFILE: {
+            if (!options->control) {
+                break;
+            }
+            file_handler_action_t action;
+            if (is_apk(event->drop.file)) {
+                action = ACTION_INSTALL_APK;
+            } else {
+                action = ACTION_PUSH_FILE;
+            }
+            file_handler_request(&file_handler, action, event->drop.file);
+            break;
+        }
+    }
+    return EVENT_RESULT_CONTINUE;
 }
 
 static bool
-is_shortcut_mod(struct input_manager *im, uint16_t sdl_mod) {
-    // keep only the relevant modifier keys
-    sdl_mod &= SC_SDL_SHORTCUT_MODS_MASK;
-
-    assert(im->sdl_shortcut_mods.count);
-    assert(im->sdl_shortcut_mods.count < SC_MAX_SHORTCUT_MODS);
-    for (unsigned i = 0; i < im->sdl_shortcut_mods.count; ++i) {
-        if (im->sdl_shortcut_mods.data[i] == sdl_mod) {
-            return true;
+event_loop(const struct scrcpy_options *options) {
+#ifdef CONTINUOUS_RESIZING_WORKAROUND
+    if (options->display) {
+        SDL_AddEventWatch(event_watcher, NULL);
+    }
+#endif
+    SDL_Event event;
+    while (SDL_WaitEvent(&event)) {
+        enum event_result result = handle_event(&event, options);
+        switch (result) {
+            case EVENT_RESULT_STOPPED_BY_USER:
+                return true;
+            case EVENT_RESULT_STOPPED_BY_EOS:
+                LOGW("Device disconnected");
+                return false;
+            case EVENT_RESULT_CONTINUE:
+                break;
         }
     }
-
     return false;
 }
 
-void
-input_manager_init(struct input_manager *im,
-                   const struct scrcpy_options *options)
-{
-    im->control = options->control;
-    im->forward_key_repeat = options->forward_key_repeat;
-    im->prefer_text = options->prefer_text;
-    im->forward_all_clicks = options->forward_all_clicks;
-    im->legacy_paste = options->legacy_paste;
-
-    const struct sc_shortcut_mods *shortcut_mods = &options->shortcut_mods;
-    assert(shortcut_mods->count);
-    assert(shortcut_mods->count < SC_MAX_SHORTCUT_MODS);
-    for (unsigned i = 0; i < shortcut_mods->count; ++i) {
-        uint16_t sdl_mod = to_sdl_mod(shortcut_mods->data[i]);
-        assert(sdl_mod);
-        im->sdl_shortcut_mods.data[i] = sdl_mod;
+static SDL_LogPriority
+sdl_priority_from_av_level(int level) {
+    switch (level) {
+        case AV_LOG_PANIC:
+        case AV_LOG_FATAL:
+            return SDL_LOG_PRIORITY_CRITICAL;
+        case AV_LOG_ERROR:
+            return SDL_LOG_PRIORITY_ERROR;
+        case AV_LOG_WARNING:
+            return SDL_LOG_PRIORITY_WARN;
+        case AV_LOG_INFO:
+            return SDL_LOG_PRIORITY_INFO;
     }
-    im->sdl_shortcut_mods.count = shortcut_mods->count;
-
-    im->vfinger_down = false;
+    // do not forward others, which are too verbose
+    return 0;
 }
 
 static void
-send_keycode(struct controller *controller, enum android_keycode keycode,
-             int actions, const char *name) {
-    // send DOWN event
-    struct control_msg msg;
-    msg.type = CONTROL_MSG_TYPE_INJECT_KEYCODE;
-    msg.inject_keycode.keycode = keycode;
-    msg.inject_keycode.metastate = 0;
-    msg.inject_keycode.repeat = 0;
-
-    if (actions & ACTION_DOWN) {
-        msg.inject_keycode.action = AKEY_EVENT_ACTION_DOWN;
-        if (!controller_push_msg(controller, &msg)) {
-            LOGW("Could not request 'inject %s (DOWN)'", name);
-            return;
-        }
-    }
-
-    if (actions & ACTION_UP) {
-        msg.inject_keycode.action = AKEY_EVENT_ACTION_UP;
-        if (!controller_push_msg(controller, &msg)) {
-            LOGW("Could not request 'inject %s (UP)'", name);
-        }
-    }
-}
-
-static inline void
-action_home(struct controller *controller, int actions) {
-    send_keycode(controller, AKEYCODE_HOME, actions, "HOME");
-}
-
-static inline void
-action_back(struct controller *controller, int actions) {
-    send_keycode(controller, AKEYCODE_BACK, actions, "BACK");
-}
-
-static inline void
-action_app_switch(struct controller *controller, int actions) {
-    send_keycode(controller, AKEYCODE_APP_SWITCH, actions, "APP_SWITCH");
-}
-
-static inline void
-action_power(struct controller *controller, int actions) {
-    send_keycode(controller, AKEYCODE_POWER, actions, "POWER");
-}
-
-static inline void
-action_volume_up(struct controller *controller, int actions) {
-    send_keycode(controller, AKEYCODE_VOLUME_UP, actions, "VOLUME_UP");
-}
-
-static inline void
-action_volume_down(struct controller *controller, int actions) {
-    send_keycode(controller, AKEYCODE_VOLUME_DOWN, actions, "VOLUME_DOWN");
-}
-
-static inline void
-action_menu(struct controller *controller, int actions) {
-    send_keycode(controller, AKEYCODE_MENU, actions, "MENU");
-}
-
-static inline void
-action_copy(struct controller *controller, int actions) {
-    send_keycode(controller, AKEYCODE_COPY, actions, "COPY");
-}
-
-static inline void
-action_cut(struct controller *controller, int actions) {
-    send_keycode(controller, AKEYCODE_CUT, actions, "CUT");
-}
-
-// turn the screen on if it was off, press BACK otherwise
-static void
-press_back_or_turn_screen_on(struct controller *controller) {
-    struct control_msg msg;
-    msg.type = CONTROL_MSG_TYPE_BACK_OR_SCREEN_ON;
-
-    if (!controller_push_msg(controller, &msg)) {
-        LOGW("Could not request 'press back or turn screen on'");
-    }
-}
-
-static void
-expand_notification_panel(struct controller *controller) {
-    struct control_msg msg;
-    msg.type = CONTROL_MSG_TYPE_EXPAND_NOTIFICATION_PANEL;
-
-    if (!controller_push_msg(controller, &msg)) {
-        LOGW("Could not request 'expand notification panel'");
-    }
-}
-
-static void
-collapse_notification_panel(struct controller *controller) {
-    struct control_msg msg;
-    msg.type = CONTROL_MSG_TYPE_COLLAPSE_NOTIFICATION_PANEL;
-
-    if (!controller_push_msg(controller, &msg)) {
-        LOGW("Could not request 'collapse notification panel'");
-    }
-}
-
-static void
-set_device_clipboard(struct controller *controller, bool paste) {
-    char *text = SDL_GetClipboardText();
-    if (!text) {
-        LOGW("Could not get clipboard text: %s", SDL_GetError());
+av_log_callback(void *avcl, int level, const char *fmt, va_list vl) {
+    (void) avcl;
+    SDL_LogPriority priority = sdl_priority_from_av_level(level);
+    if (priority == 0) {
         return;
     }
-    if (!*text) {
-        // empty text
-        SDL_free(text);
+    char *local_fmt = SDL_malloc(strlen(fmt) + 10);
+    if (!local_fmt) {
+        LOGC("Could not allocate string");
         return;
     }
-
-    struct control_msg msg;
-    msg.type = CONTROL_MSG_TYPE_SET_CLIPBOARD;
-    msg.set_clipboard.text = text;
-    msg.set_clipboard.paste = paste;
-
-    if (!controller_push_msg(controller, &msg)) {
-        SDL_free(text);
-        LOGW("Could not request 'set device clipboard'");
-    }
+    // strcpy is safe here, the destination is large enough
+    strcpy(local_fmt, "[FFmpeg] ");
+    strcpy(local_fmt + 9, fmt);
+    SDL_LogMessageV(SDL_LOG_CATEGORY_VIDEO, priority, local_fmt, vl);
+    SDL_free(local_fmt);
 }
 
-static void
-set_screen_power_mode(struct controller *controller,
-                      enum screen_power_mode mode) {
-    struct control_msg msg;
-    msg.type = CONTROL_MSG_TYPE_SET_SCREEN_POWER_MODE;
-    msg.set_screen_power_mode.mode = mode;
-
-    if (!controller_push_msg(controller, &msg)) {
-        LOGW("Could not request 'set screen power mode'");
-    }
-}
-
-static void
-switch_fps_counter_state(struct fps_counter *fps_counter) {
-    // the started state can only be written from the current thread, so there
-    // is no ToCToU issue
-    if (fps_counter_is_started(fps_counter)) {
-        fps_counter_stop(fps_counter);
-        LOGI("FPS counter stopped");
-    } else {
-        if (fps_counter_start(fps_counter)) {
-            LOGI("FPS counter started");
-        } else {
-            LOGE("FPS counter starting failed");
-        }
-    }
-}
-
-static void
-clipboard_paste(struct controller *controller) {
-    char *text = SDL_GetClipboardText();
-    if (!text) {
-        LOGW("Could not get clipboard text: %s", SDL_GetError());
-        return;
-    }
-    if (!*text) {
-        // empty text
-        SDL_free(text);
-        return;
-    }
-
-    struct control_msg msg;
-    msg.type = CONTROL_MSG_TYPE_INJECT_TEXT;
-    msg.inject_text.text = text;
-    if (!controller_push_msg(controller, &msg)) {
-        SDL_free(text);
-        LOGW("Could not request 'paste clipboard'");
-    }
-}
-
-static void
-rotate_device(struct controller *controller) {
-    struct control_msg msg;
-    msg.type = CONTROL_MSG_TYPE_ROTATE_DEVICE;
-
-    if (!controller_push_msg(controller, &msg)) {
-        LOGW("Could not request device rotation");
-    }
-}
-
-static void
-rotate_client_left(struct screen *screen) {
-    unsigned new_rotation = (screen->rotation + 1) % 4;
-    screen_set_rotation(screen, new_rotation);
-}
-
-static void
-rotate_client_right(struct screen *screen) {
-    unsigned new_rotation = (screen->rotation + 3) % 4;
-    screen_set_rotation(screen, new_rotation);
-}
-
-void
-input_manager_process_text_input(struct input_manager *im,
-                                 const SDL_TextInputEvent *event) {
-    if (is_shortcut_mod(im, SDL_GetModState())) {
-        // A shortcut must never generate text events
-        return;
-    }
-    if (!im->prefer_text) {
-        char c = event->text[0];
-        if (isalpha(c) || c == ' ') {
-            assert(event->text[1] == '\0');
-            // letters and space are handled as raw key event
-            return;
-        }
-    }
-
-    struct control_msg msg;
-    msg.type = CONTROL_MSG_TYPE_INJECT_TEXT;
-    msg.inject_text.text = SDL_strdup(event->text);
-    if (!msg.inject_text.text) {
-        LOGW("Could not strdup input text");
-        return;
-    }
-    if (!controller_push_msg(im->controller, &msg)) {
-        SDL_free(msg.inject_text.text);
-        LOGW("Could not request 'inject text'");
-    }
-}
-
-static bool
-simulate_virtual_finger(struct input_manager *im,
-                        enum android_motionevent_action action,
-                        struct point point) {
-    bool up = action == AMOTION_EVENT_ACTION_UP;
-
-    struct control_msg msg;
-    msg.type = CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT;
-    msg.inject_touch_event.action = action;
-    msg.inject_touch_event.position.screen_size = im->screen->frame_size;
-    msg.inject_touch_event.position.point = point;
-    msg.inject_touch_event.pointer_id = POINTER_ID_VIRTUAL_FINGER;
-    msg.inject_touch_event.pressure = up ? 0.0f : 1.0f;
-    msg.inject_touch_event.buttons = 0;
-
-    if (!controller_push_msg(im->controller, &msg)) {
-        LOGW("Could not request 'inject virtual finger event'");
+bool
+scrcpy(const struct scrcpy_options *options) {
+    if (!server_init(&server)) {
         return false;
     }
 
-    return true;
-}
+    bool ret = false;
 
-static struct point
-inverse_point(struct point point, struct size size) {
-    point.x = size.width - point.x;
-    point.y = size.height - point.y;
-    return point;
-}
+    bool server_started = false;
+    bool fps_counter_initialized = false;
+    bool video_buffer_initialized = false;
+    bool file_handler_initialized = false;
+    bool recorder_initialized = false;
+    bool stream_started = false;
+    bool controller_initialized = false;
+    bool controller_started = false;
 
-static bool
-convert_input_key(const SDL_KeyboardEvent *from, struct control_msg *to,
-                  bool prefer_text, uint32_t repeat) {
-    to->type = CONTROL_MSG_TYPE_INJECT_KEYCODE;
-
-    if (!convert_keycode_action(from->type, &to->inject_keycode.action)) {
-        return false;
+    bool record = !!options->record_filename;
+    struct server_params params = {
+        .log_level = options->log_level,
+        .crop = options->crop,
+        .port_range = options->port_range,
+        .max_size = options->max_size,
+        .bit_rate = options->bit_rate,
+        .max_fps = options->max_fps,
+        .lock_video_orientation = options->lock_video_orientation,
+        .control = options->control,
+        .display_id = options->display_id,
+        .show_touches = options->show_touches,
+        .stay_awake = options->stay_awake,
+        .codec_options = options->codec_options,
+        .encoder_name = options->encoder_name,
+        .force_adb_forward = options->force_adb_forward,
+    };
+    if (!server_start(&server, options->serial, &params)) {
+        goto end;
     }
 
-    uint16_t mod = from->keysym.mod;
-    if (!convert_keycode(from->keysym.sym, &to->inject_keycode.keycode, mod,
-                         prefer_text)) {
-        return false;
+    server_started = true;
+
+    if (!sdl_init_and_configure(options->display, options->render_driver,
+                                options->disable_screensaver)) {
+        goto end;
     }
 
-    to->inject_keycode.repeat = repeat;
-    to->inject_keycode.metastate = convert_meta_state(mod);
+    if (!server_connect_to(&server)) {
+        goto end;
+    }
 
-    return true;
-}
+    char device_name[DEVICE_NAME_FIELD_LENGTH];
+    struct size frame_size;
 
-void
-input_manager_process_key(struct input_manager *im,
-                          const SDL_KeyboardEvent *event) {
-    // control: indicates the state of the command-line option --no-control
-    bool control = im->control;
+    // screenrecord does not send frames when the screen content does not
+    // change therefore, we transmit the screen size before the video stream,
+    // to be able to init the window immediately
+    if (!device_read_info(server.video_socket, device_name, &frame_size)) {
+        goto end;
+    }
 
-    bool smod = is_shortcut_mod(im, event->keysym.mod);
+    struct decoder *dec = NULL;
+    if (options->display) {
+        if (!fps_counter_init(&fps_counter)) {
+            goto end;
+        }
+        fps_counter_initialized = true;
 
-    struct controller *controller = im->controller;
+        if (!video_buffer_init(&video_buffer, &fps_counter,
+                               options->render_expired_frames)) {
+            goto end;
+        }
+        video_buffer_initialized = true;
 
-    SDL_Keycode keycode = event->keysym.sym;
-    bool down = event->type == SDL_KEYDOWN;
-    bool ctrl = event->keysym.mod & KMOD_CTRL;
-    bool shift = event->keysym.mod & KMOD_SHIFT;
-    bool repeat = event->repeat;
-
-    // The shortcut modifier is pressed
-    if (smod) {
-        int action = down ? ACTION_DOWN : ACTION_UP;
-        switch (keycode) {
-            case SDLK_h:
-                if (control && !shift && !repeat) {
-                    action_home(controller, action);
-                }
-                return;
-            case SDLK_b: // fall-through
-            case SDLK_BACKSPACE:
-                if (control && !shift && !repeat) {
-                    action_back(controller, action);
-                }
-                return;
-            case SDLK_s:
-                if (control && !shift && !repeat) {
-                    action_app_switch(controller, action);
-                }
-                return;
-            case SDLK_m:
-                if (control && !shift && !repeat) {
-                    action_menu(controller, action);
-                }
-                return;
-            case SDLK_p:
-                if (control && !shift && !repeat) {
-                    action_power(controller, action);
-                }
-                return;
-            case SDLK_o:
-                if (control && !repeat && down) {
-                    enum screen_power_mode mode = shift
-                                                ? SCREEN_POWER_MODE_NORMAL
-                                                : SCREEN_POWER_MODE_OFF;
-                    set_screen_power_mode(controller, mode);
-                }
-                return;
-            case SDLK_DOWN:
-                if (control && !shift) {
-                    // forward repeated events
-                    action_volume_down(controller, action);
-                }
-                return;
-            case SDLK_UP:
-                if (control && !shift) {
-                    // forward repeated events
-                    action_volume_up(controller, action);
-                }
-                return;
-            case SDLK_LEFT:
-                if (!shift && !repeat && down) {
-                    rotate_client_left(im->screen);
-                }
-                return;
-            case SDLK_RIGHT:
-                if (!shift && !repeat && down) {
-                    rotate_client_right(im->screen);
-                }
-                return;
-            case SDLK_c:
-                if (control && !shift && !repeat) {
-                    action_copy(controller, action);
-                }
-                return;
-            case SDLK_x:
-                if (control && !shift && !repeat) {
-                    action_cut(controller, action);
-                }
-                return;
-            case SDLK_v:
-                if (control && !repeat && down) {
-                    if (shift || im->legacy_paste) {
-                        // inject the text as input events
-                        clipboard_paste(controller);
-                    } else {
-                        // store the text in the device clipboard and paste
-                        set_device_clipboard(controller, true);
-                    }
-                }
-                return;
-            case SDLK_f:
-                if (!shift && !repeat && down) {
-                    screen_switch_fullscreen(im->screen);
-                }
-                return;
-            case SDLK_w:
-                if (!shift && !repeat && down) {
-                    screen_resize_to_fit(im->screen);
-                }
-                return;
-            case SDLK_g:
-                if (!shift && !repeat && down) {
-                    screen_resize_to_pixel_perfect(im->screen);
-                }
-                return;
-            case SDLK_i:
-                if (!shift && !repeat && down) {
-                    struct fps_counter *fps_counter =
-                        im->video_buffer->fps_counter;
-                    switch_fps_counter_state(fps_counter);
-                }
-                return;
-            case SDLK_n:
-                if (control && !repeat && down) {
-                    if (shift) {
-                        collapse_notification_panel(controller);
-                    } else {
-                        expand_notification_panel(controller);
-                    }
-                }
-                return;
-            case SDLK_r:
-                if (control && !shift && !repeat && down) {
-                    rotate_device(controller);
-                }
-                return;
+        if (options->control) {
+            if (!file_handler_init(&file_handler, server.serial,
+                                   options->push_target)) {
+                goto end;
+            }
+            file_handler_initialized = true;
         }
 
-        return;
+        decoder_init(&decoder, &video_buffer);
+        dec = &decoder;
     }
 
-    if (!control) {
-        return;
-    }
-
-    if (event->repeat) {
-        if (!im->forward_key_repeat) {
-            return;
+    struct recorder *rec = NULL;
+    if (record) {
+        if (!recorder_init(&recorder,
+                           options->record_filename,
+                           options->record_format,
+                           frame_size)) {
+            goto end;
         }
-        ++im->repeat;
-    } else {
-        im->repeat = 0;
+        rec = &recorder;
+        recorder_initialized = true;
     }
 
-    if (ctrl && !shift && keycode == SDLK_v && down && !repeat) {
-        if (im->legacy_paste) {
-            // inject the text as input events
-            clipboard_paste(controller);
-            return;
-        }
-        // Synchronize the computer clipboard to the device clipboard before
-        // sending Ctrl+v, to allow seamless copy-paste.
-        set_device_clipboard(controller, false);
+    av_log_set_callback(av_log_callback);
+
+    stream_init(&stream, server.video_socket, dec, rec);
+
+    // now we consumed the header values, the socket receives the video stream
+    // start the stream
+    if (!stream_start(&stream)) {
+        goto end;
     }
+    stream_started = true;
 
-    struct control_msg msg;
-    if (convert_input_key(event, &msg, im->prefer_text, im->repeat)) {
-        if (!controller_push_msg(controller, &msg)) {
-            LOGW("Could not request 'inject keycode'");
-        }
-    }
-}
+    if (options->display) {
+        if (options->control) {
+            if (!controller_init(&controller, server.control_socket)) {
+                goto end;
+            }
+            controller_initialized = true;
 
-static bool
-convert_mouse_motion(const SDL_MouseMotionEvent *from, struct screen *screen,
-                     struct control_msg *to) {
-    to->type = CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT;
-    to->inject_touch_event.action = AMOTION_EVENT_ACTION_MOVE;
-    to->inject_touch_event.pointer_id = POINTER_ID_MOUSE;
-    to->inject_touch_event.position.screen_size = screen->frame_size;
-    to->inject_touch_event.position.point =
-        screen_convert_window_to_frame_coords(screen, from->x, from->y);
-    to->inject_touch_event.pressure = 1.f;
-    to->inject_touch_event.buttons = convert_mouse_buttons(from->state);
-
-    return true;
-}
-
-void
-input_manager_process_mouse_motion(struct input_manager *im,
-                                   const SDL_MouseMotionEvent *event) {
-    if (!event->state) {
-        // do not send motion events when no button is pressed
-        return;
-    }
-    if (event->which == SDL_TOUCH_MOUSEID) {
-        // simulated from touch events, so it's a duplicate
-        return;
-    }
-    struct control_msg msg;
-    if (!convert_mouse_motion(event, im->screen, &msg)) {
-        return;
-    }
-
-    if (!controller_push_msg(im->controller, &msg)) {
-        LOGW("Could not request 'inject mouse motion event'");
-    }
-
-    if (im->vfinger_down) {
-        struct point mouse = msg.inject_touch_event.position.point;
-        struct point vfinger = inverse_point(mouse, im->screen->frame_size);
-        simulate_virtual_finger(im, AMOTION_EVENT_ACTION_MOVE, vfinger);
-    }
-}
-
-static bool
-convert_touch(const SDL_TouchFingerEvent *from, struct screen *screen,
-              struct control_msg *to) {
-    to->type = CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT;
-
-    if (!convert_touch_action(from->type, &to->inject_touch_event.action)) {
-        return false;
-    }
-
-    to->inject_touch_event.pointer_id = from->fingerId;
-    to->inject_touch_event.position.screen_size = screen->frame_size;
-
-    int dw;
-    int dh;
-    SDL_GL_GetDrawableSize(screen->window, &dw, &dh);
-
-    // SDL touch event coordinates are normalized in the range [0; 1]
-    int32_t x = from->x * dw;
-    int32_t y = from->y * dh;
-    to->inject_touch_event.position.point =
-        screen_convert_drawable_to_frame_coords(screen, x, y);
-
-    to->inject_touch_event.pressure = from->pressure;
-    to->inject_touch_event.buttons = 0;
-    return true;
-}
-
-void
-input_manager_process_touch(struct input_manager *im,
-                            const SDL_TouchFingerEvent *event) {
-    struct control_msg msg;
-    if (convert_touch(event, im->screen, &msg)) {
-        if (!controller_push_msg(im->controller, &msg)) {
-            LOGW("Could not request 'inject touch event'");
-        }
-    }
-}
-
-static bool
-convert_mouse_button(const SDL_MouseButtonEvent *from, struct screen *screen,
-                     struct control_msg *to) {
-    to->type = CONTROL_MSG_TYPE_INJECT_TOUCH_EVENT;
-
-    if (!convert_mouse_action(from->type, &to->inject_touch_event.action)) {
-        return false;
-    }
-
-    to->inject_touch_event.pointer_id = POINTER_ID_MOUSE;
-    to->inject_touch_event.position.screen_size = screen->frame_size;
-    to->inject_touch_event.position.point =
-        screen_convert_window_to_frame_coords(screen, from->x, from->y);
-    to->inject_touch_event.pressure =
-        from->type == SDL_MOUSEBUTTONDOWN ? 1.f : 0.f;
-    to->inject_touch_event.buttons =
-        convert_mouse_buttons(SDL_BUTTON(from->button));
-
-    return true;
-}
-
-void
-input_manager_process_mouse_button(struct input_manager *im,
-                                   const SDL_MouseButtonEvent *event) {
-    bool control = im->control;
-
-    if (event->which == SDL_TOUCH_MOUSEID) {
-        // simulated from touch events, so it's a duplicate
-        return;
-    }
-
-    bool down = event->type == SDL_MOUSEBUTTONDOWN;
-    if (!im->forward_all_clicks && down) {
-        if (control && event->button == SDL_BUTTON_RIGHT) {
-            press_back_or_turn_screen_on(im->controller);
-            return;
-        }
-        if (control && event->button == SDL_BUTTON_MIDDLE) {
-            action_home(im->controller, ACTION_DOWN | ACTION_UP);
-            return;
+            if (!controller_start(&controller)) {
+                goto end;
+            }
+            controller_started = true;
         }
 
-        // double-click on black borders resize to fit the device screen
-        if (event->button == SDL_BUTTON_LEFT && event->clicks == 2) {
-            int32_t x = event->x;
-            int32_t y = event->y;
-            screen_hidpi_scale_coords(im->screen, &x, &y);
-            SDL_Rect *r = &im->screen->rect;
-            bool outside = x < r->x || x >= r->x + r->w
-                        || y < r->y || y >= r->y + r->h;
-            if (outside) {
-                screen_resize_to_fit(im->screen);
-                return;
+        const char *window_title =
+            options->window_title ? options->window_title : device_name;
+
+        if (!screen_init_rendering(&screen, window_title, frame_size,
+                                   options->always_on_top, options->window_x,
+                                   options->window_y, options->window_width,
+                                   options->window_height,
+                                   options->window_borderless,
+                                   options->rotation, options->mipmaps)) {
+            goto end;
+        }
+
+        if (options->turn_screen_off) {
+            struct control_msg msg;
+            msg.type = CONTROL_MSG_TYPE_SET_SCREEN_POWER_MODE;
+            msg.set_screen_power_mode.mode = SCREEN_POWER_MODE_OFF;
+
+            if (!controller_push_msg(&controller, &msg)) {
+                LOGW("Could not request 'set screen power mode'");
             }
         }
-        // otherwise, send the click event to the device
-    }
 
-    if (!control) {
-        return;
-    }
-
-    struct control_msg msg;
-    if (!convert_mouse_button(event, im->screen, &msg)) {
-        return;
-    }
-
-    if (!controller_push_msg(im->controller, &msg)) {
-        LOGW("Could not request 'inject mouse button event'");
-        return;
-    }
-
-    // Pinch-to-zoom simulation.
-    //
-    // If Ctrl is hold when the left-click button is pressed, then
-    // pinch-to-zoom mode is enabled: on every mouse event until the left-click
-    // button is released, an additional "virtual finger" event is generated,
-    // having a position inverted through the center of the screen.
-    //
-    // In other words, the center of the rotation/scaling is the center of the
-    // screen.
-#define CTRL_PRESSED (SDL_GetModState() & (KMOD_LCTRL | KMOD_RCTRL))
-    if ((down && !im->vfinger_down && CTRL_PRESSED)
-            || (!down && im->vfinger_down)) {
-        struct point mouse = msg.inject_touch_event.position.point;
-        struct point vfinger = inverse_point(mouse, im->screen->frame_size);
-        enum android_motionevent_action action = down
-                                               ? AMOTION_EVENT_ACTION_DOWN
-                                               : AMOTION_EVENT_ACTION_UP;
-        if (!simulate_virtual_finger(im, action, vfinger)) {
-            return;
-        }
-        im->vfinger_down = down;
-    }
-}
-
-static bool
-convert_mouse_wheel(const SDL_MouseWheelEvent *from, struct screen *screen,
-                    struct control_msg *to) {
-
-    // mouse_x and mouse_y are expressed in pixels relative to the window
-    int mouse_x;
-    int mouse_y;
-    SDL_GetMouseState(&mouse_x, &mouse_y);
-
-    struct position position = {
-        .screen_size = screen->frame_size,
-        .point = screen_convert_window_to_frame_coords(screen,
-                                                       mouse_x, mouse_y),
-    };
-
-    to->type = CONTROL_MSG_TYPE_INJECT_SCROLL_EVENT;
-
-    to->inject_scroll_event.position = position;
-    to->inject_scroll_event.hscroll = from->x;
-    to->inject_scroll_event.vscroll = from->y;
-
-    return true;
-}
-
-void
-input_manager_process_mouse_wheel(struct input_manager *im,
-                                  const SDL_MouseWheelEvent *event) {
-    struct control_msg msg;
-    if (convert_mouse_wheel(event, im->screen, &msg)) {
-        if (!controller_push_msg(im->controller, &msg)) {
-            LOGW("Could not request 'inject mouse wheel event'");
+        if (options->fullscreen) {
+            screen_switch_fullscreen(&screen);
         }
     }
+
+    input_manager_init(&input_manager, options);
+
+    ret = event_loop(options);
+    LOGD("quit...");
+
+    screen_destroy(&screen);
+
+end:
+    // stop stream and controller so that they don't continue once their socket
+    // is shutdown
+    if (stream_started) {
+        stream_stop(&stream);
+    }
+    if (controller_started) {
+        controller_stop(&controller);
+    }
+    if (file_handler_initialized) {
+        file_handler_stop(&file_handler);
+    }
+    if (fps_counter_initialized) {
+        fps_counter_interrupt(&fps_counter);
+    }
+
+    if (server_started) {
+        // shutdown the sockets and kill the server
+        server_stop(&server);
+    }
+
+    // now that the sockets are shutdown, the stream and controller are
+    // interrupted, we can join them
+    if (stream_started) {
+        stream_join(&stream);
+    }
+    if (controller_started) {
+        controller_join(&controller);
+    }
+    if (controller_initialized) {
+        controller_destroy(&controller);
+    }
+
+    if (recorder_initialized) {
+        recorder_destroy(&recorder);
+    }
+
+    if (file_handler_initialized) {
+        file_handler_join(&file_handler);
+        file_handler_destroy(&file_handler);
+    }
+
+    if (video_buffer_initialized) {
+        video_buffer_destroy(&video_buffer);
+    }
+
+    if (fps_counter_initialized) {
+        fps_counter_join(&fps_counter);
+        fps_counter_destroy(&fps_counter);
+    }
+
+    server_destroy(&server);
+
+    return ret;
 }
